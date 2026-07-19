@@ -7,34 +7,35 @@ import (
 )
 
 type HistoryEntry[T any] struct {
-	RecordedAt time.Time
-	Data       T
+	RecordedAt time.Time `json:"recordedAt"`
+	Data       T         `json:"data"`
 }
+
 type HistoryData[T any] struct {
-	Start   T
-	History []HistoryEntry[T]
+	Start   T                 `json:"start"`
+	History []HistoryEntry[T] `json:"history"`
 }
 
 type User struct {
-	ID            string
-	Username      string
-	GlobalName    string
-	DisplayName   string
-	Discriminator string
-	Avatar        string
-	Banner        string
-	AccentColor   int
-	Status        string
+	ID            string `json:"id"`
+	Username      string `json:"username"`
+	GlobalName    string `json:"globalName"`
+	DisplayName   string `json:"displayName"`
+	Discriminator string `json:"discriminator"`
+	Avatar        string `json:"avatar"`
+	Banner        string `json:"banner"`
+	AccentColor   int    `json:"accentColor"`
+	Status        string `json:"status"`
 }
 
 type Guild struct {
-	ID              string
-	Name            string
-	Description     string
-	Icon            string
-	Banner          string
-	Splash          string
-	DiscoverySplash string
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Description     string `json:"description"`
+	Icon            string `json:"icon"`
+	Banner          string `json:"banner"`
+	Splash          string `json:"splash"`
+	DiscoverySplash string `json:"discoverySplash"`
 }
 
 type MemberOperation string
@@ -47,19 +48,19 @@ const (
 )
 
 type Member struct {
-	Operation                  MemberOperation
-	UserID                     string
-	Nickname                   string
-	Roles                      []string
-	JoinedAt                   time.Time
-	CommunicationDisabledUntil *time.Time
+	Operation                  MemberOperation `json:"operation"`
+	UserID                     string          `json:"userId"`
+	Nickname                   string          `json:"nickname"`
+	Roles                      []string        `json:"roles"`
+	JoinedAt                   time.Time       `json:"joinedAt"`
+	CommunicationDisabledUntil *time.Time      `json:"communicationDisabledUntil"`
 }
 
 type Channel struct {
-	ID       string
-	Name     string
-	Topic    string
-	IsThread bool
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Topic    string `json:"topic"`
+	IsThread bool   `json:"isThread"`
 }
 
 type MessageOperation string
@@ -71,26 +72,26 @@ const (
 )
 
 type Attachment struct {
-	Filename  string
-	URL       string
-	LocalPath string
-	Size      int64
+	Filename  string `json:"filename"`
+	URL       string `json:"url"`
+	LocalPath string `json:"localPath"`
+	Size      int64  `json:"size"`
 }
 
 type Message struct {
-	Operation       MessageOperation
-	ID              string
-	AuthorID        string
-	Content         string
-	Embeds          []discordgo.MessageEmbed
-	Attachments     []Attachment
-	Timestamp       time.Time
-	EditedTimestamp *time.Time
+	Operation       MessageOperation         `json:"operation"`
+	ID              string                   `json:"id"`
+	AuthorID        string                   `json:"authorId"`
+	Content         string                   `json:"content"`
+	Embeds          []discordgo.MessageEmbed `json:"embeds"`
+	Attachments     []Attachment             `json:"attachments"`
+	Timestamp       time.Time                `json:"timestamp"`
+	EditedTimestamp *time.Time               `json:"editedTimestamp"`
 }
 
 type Emoji struct {
-	ID       string
-	Name     string
-	Animated bool
-	Image    string
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Animated bool   `json:"animated"`
+	Image    string `json:"image"`
 }
