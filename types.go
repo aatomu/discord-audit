@@ -25,7 +25,6 @@ type User struct {
 	Avatar        string `json:"avatar"`
 	Banner        string `json:"banner"`
 	AccentColor   int    `json:"accentColor"`
-	Status        string `json:"status"`
 }
 
 type Guild struct {
