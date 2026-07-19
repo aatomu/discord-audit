@@ -526,7 +526,10 @@ func saveMemberData(guildID, userID string, member *discordgo.Member) {
 		return
 	}
 	if latest == nil {
-		current.Operation = MemberJoin
+		// GuildMemberAdd イベント経由ではなくメッセージ等から初めて検出した場合は、
+		// Bot起動前から既に存在していたメンバーの可能性があるため Join ではなく
+		// Previous として記録する(実際の参加は onGuildMemberAdd が担当する)。
+		current.Operation = MemberPrevious
 	}
 
 	if err := appendMemberLog(guildID, current); err != nil {
@@ -567,7 +570,8 @@ func memberChanged(guildID, userID string, current Member) (bool, *Member) {
 			}
 			last := records[j]
 			if last.Operation == MemberLeave {
-				// 離脱後の再参加は必ずJoinとして扱う
+				// 離脱後の再検出はイベントとしての参加確認ができないため、
+				// (true, nil) を返して呼び出し側に Previous として記録させる。
 				return true, nil
 			}
 			if last.Nickname == current.Nickname && stringSlicesEqual(last.Roles, current.Roles) {
