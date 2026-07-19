@@ -307,7 +307,7 @@ func saveUserData(author *discordgo.User) {
 		Avatar:        author.Avatar,
 	}
 
-	changed, err := appendHistoryIfChanged(userConfigsDir(author.ID), current)
+	changed, err := appendHistoryIfChanged(userDir(author.ID), current)
 	if err != nil {
 		log.Printf("警告: ユーザー(%s)の設定保存に失敗しました: %v", author.ID, err)
 	} else if changed {
@@ -358,7 +358,7 @@ func saveGuildDataFromGuild(guild *discordgo.Guild) {
 		DiscoverySplash: guild.DiscoverySplash,
 	}
 
-	changed, err := appendHistoryIfChanged(guildConfigsDir(guild.ID), current)
+	changed, err := appendHistoryIfChanged(guildDir(guild.ID), current)
 	if err != nil {
 		log.Printf("警告: ギルド(%s)の設定保存に失敗しました: %v", guild.ID, err)
 	} else if changed {
@@ -445,7 +445,7 @@ func saveChannelDataFromChannel(guildID string, channel *discordgo.Channel) {
 		IsThread: channel.IsThread(),
 	}
 
-	changed, err := appendHistoryIfChanged(channelConfigsDir(guildID, channel.ID), current)
+	changed, err := appendHistoryIfChanged(channelDir(guildID, channel.ID), current)
 	if err != nil {
 		log.Printf("警告: チャンネル(%s)の設定保存に失敗しました: %v", channel.ID, err)
 	} else if changed {

@@ -19,20 +19,12 @@ func userDir(userID string) string {
 	return filepath.Join("user", userID)
 }
 
-func userConfigsDir(userID string) string {
-	return filepath.Join(userDir(userID), "configs")
-}
-
 func userIconsDir(userID string) string {
 	return filepath.Join(userDir(userID), "icons")
 }
 
 func guildDir(guildID string) string {
 	return filepath.Join("guilds", guildID)
-}
-
-func guildConfigsDir(guildID string) string {
-	return filepath.Join(guildDir(guildID), "configs")
 }
 
 func guildIconsDir(guildID string) string {
@@ -49,10 +41,6 @@ func guildMembersDir(guildID string) string {
 
 func channelDir(guildID, channelID string) string {
 	return filepath.Join(guildDir(guildID), "channels", channelID)
-}
-
-func channelConfigsDir(guildID, channelID string) string {
-	return filepath.Join(channelDir(guildID, channelID), "configs")
 }
 
 func channelAttachmentsDir(guildID, channelID string) string {
@@ -102,7 +90,7 @@ func unmarshalJSON(data []byte, out interface{}) error {
 
 // ---------- 設定(config)差分チェック: HistoryData方式 ----------
 //
-// 各エンティティ(ユーザー/サーバー/チャンネル)ごとに configs/config.json という
+// 各エンティティ(ユーザー/サーバー/チャンネル)ごとに config.json という
 // 単一ファイルを持ち、HistoryData{ Start, History []HistoryEntry } として蓄積する。
 // 変化が検出された時だけ HistoryEntry{ RecordedAt, Data } を History に追記する。
 
