@@ -2,11 +2,11 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -84,7 +84,7 @@ func main() {
 	}
 	defer dg.Close()
 
-	fmt.Println("Botが起動しました。Ctrl+C で終了します。")
+	log.Println("Botが起動しました。Ctrl+C で終了します。")
 
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
@@ -98,37 +98,42 @@ func main() {
 // Discordのレート制限(概ね50 req/秒)の半分以下(20 req/秒)で処理する。
 
 func runPreload(s *discordgo.Session, until time.Time) {
-	fmt.Printf("[プリロード開始] %s まで遡ってデータを取得します\n", until.Format("2006-01-02"))
+	Log(SystemPreload, LevelInfo, nil, "%s まで遡ってデータを取得します", until.Format("2006-01-02"))
 
 	guilds := s.State.Guilds
-	for _, g := range guilds {
+	targetGuilds := len(guilds)
+	for i, g := range guilds {
+		guildNo := i + 1
+		gctx := Ctx().Guild(g.Name, g.ID)
+		Log(SystemPreload, LevelInfo, gctx, "No.%d/%d 処理を開始します", guildNo, targetGuilds)
+
 		preloadLimiter.wait()
 		full, err := s.Guild(g.ID)
 		if err != nil {
-			log.Printf("警告: ギルド(%s)の取得に失敗しました: %v", g.ID, err)
+			Log(SystemPreload, LevelWarn, gctx, "No.%d ギルドの取得に失敗しました: %v", guildNo, err)
 			continue
 		}
-		fmt.Printf("[プリロード] ギルド %s (%s) の処理を開始します\n", full.Name, full.ID)
 
 		saveGuildDataFromGuild(full)
-		preloadMembers(s, full.ID)
-		preloadChannels(s, full.ID, until)
+		preloadMembers(s, guildNo, full.Name, full.ID)
+		preloadChannels(s, guildNo, full.Name, full.ID, until)
 
-		fmt.Printf("[プリロード] ギルド %s (%s) の処理が完了しました\n", full.Name, full.ID)
+		Log(SystemPreload, LevelInfo, gctx, "No.%d 処理が完了しました", guildNo)
 	}
 
-	fmt.Println("[プリロード完了] すべてのギルドの処理が完了しました")
+	Log(SystemPreload, LevelInfo, nil, "すべてのギルドの処理が完了しました")
 }
 
 // preloadMembers はギルドの全メンバーをページングで取得し、Previous操作として記録する。
-func preloadMembers(s *discordgo.Session, guildID string) {
+func preloadMembers(s *discordgo.Session, guildNo int, guildName, guildID string) {
+	gctx := Ctx().Guild(guildName, guildID)
 	after := ""
 	total := 0
 	for {
 		preloadLimiter.wait()
 		members, err := s.GuildMembers(guildID, after, 1000)
 		if err != nil {
-			log.Printf("警告: ギルド(%s)のメンバー取得に失敗しました: %v", guildID, err)
+			Log(SystemPreload, LevelWarn, gctx, "No.%d メンバーの取得に失敗しました: %v", guildNo, err)
 			return
 		}
 		if len(members) == 0 {
@@ -148,7 +153,8 @@ func preloadMembers(s *discordgo.Session, guildID string) {
 				CommunicationDisabledUntil: m.CommunicationDisabledUntil,
 			}
 			if err := appendMemberLog(guildID, entry); err != nil {
-				log.Printf("警告: メンバー(%s)のプリロード保存に失敗しました: %v", m.User.ID, err)
+				Log(SystemPreload, LevelWarn, Ctx().Guild(guildName, guildID).User(m.User.Username, m.User.ID),
+					"No.%d メンバーの保存に失敗しました: %v", guildNo, err)
 			}
 			total++
 		}
@@ -157,16 +163,17 @@ func preloadMembers(s *discordgo.Session, guildID string) {
 			break
 		}
 	}
-	fmt.Printf("[プリロード] ギルド(%s) のメンバー %d 件を記録しました\n", guildID, total)
+	Log(SystemPreload, LevelInfo, gctx, "No.%d メンバー: %d件を記録しました", guildNo, total)
 }
 
 // preloadChannels はギルド内の全テキストチャンネル(スレッド含む)を取得し、
 // 設定を保存した上でメッセージ履歴のプリロードを行う。
-func preloadChannels(s *discordgo.Session, guildID string, until time.Time) {
+func preloadChannels(s *discordgo.Session, guildNo int, guildName, guildID string, until time.Time) {
+	gctx := Ctx().Guild(guildName, guildID)
 	preloadLimiter.wait()
 	channels, err := s.GuildChannels(guildID)
 	if err != nil {
-		log.Printf("警告: ギルド(%s)のチャンネル取得に失敗しました: %v", guildID, err)
+		Log(SystemPreload, LevelWarn, gctx, "No.%d チャンネルの取得に失敗しました: %v", guildNo, err)
 		return
 	}
 	for _, c := range channels {
@@ -174,7 +181,7 @@ func preloadChannels(s *discordgo.Session, guildID string, until time.Time) {
 			continue
 		}
 		saveChannelDataFromChannel(guildID, c)
-		preloadMessages(s, guildID, c.ID, until)
+		preloadMessages(s, guildNo, guildName, guildID, c.Name, c.ID, until)
 	}
 }
 
@@ -193,14 +200,15 @@ func isTextLikeChannel(c *discordgo.Channel) bool {
 
 // preloadMessages は指定チャンネルのメッセージを新しい方から100件ずつ遡って取得し、
 // until より古いメッセージに到達するまで保存を続ける。
-func preloadMessages(s *discordgo.Session, guildID, channelID string, until time.Time) {
+func preloadMessages(s *discordgo.Session, guildNo int, guildName, guildID, channelName, channelID string, until time.Time) {
+	cctx := Ctx().Guild(guildName, guildID).Channel(channelName, channelID)
 	beforeID := ""
 	total := 0
 	for {
 		preloadLimiter.wait()
 		msgs, err := s.ChannelMessages(channelID, 100, beforeID, "", "")
 		if err != nil {
-			log.Printf("警告: チャンネル(%s)のメッセージ取得に失敗しました: %v", channelID, err)
+			Log(SystemPreload, LevelWarn, cctx, "No.%d メッセージ取得に失敗しました: %v", guildNo, err)
 			return
 		}
 		if len(msgs) == 0 {
@@ -223,7 +231,7 @@ func preloadMessages(s *discordgo.Session, guildID, channelID string, until time
 		}
 	}
 	if total > 0 {
-		fmt.Printf("[プリロード] チャンネル(%s) のメッセージ %d 件を記録しました\n", channelID, total)
+		Log(SystemPreload, LevelInfo, cctx, "No.%d メッセージ: %d件を記録しました", guildNo, total)
 	}
 }
 
@@ -234,9 +242,21 @@ func onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	fmt.Printf("[新規メッセージ] %s: %s\n", m.Author.Username, m.Content)
+	guild, _ := s.Guild(m.GuildID)
+	guildName := "DM"
+	if guild != nil {
+		guildName = guild.Name
+	}
+	channel, _ := s.Channel(m.ChannelID)
+	channelName := "unknown"
+	if channel != nil {
+		channelName = channel.Name
+	}
 
-	// --- ユーザー情報の差分チェック・保存 ---
+	ctx := Ctx().Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).
+		User(m.Author.Username, m.Author.ID).Message(m.Message.ID)
+	Log(SystemMessage, LevelInfo, ctx, "Create: %s", strings.ReplaceAll(m.Content, "\n", "\\n"))
+
 	saveUserData(m.Author)
 
 	// --- サーバー情報の差分チェック・保存 (DMの場合はGuildIDが空) ---
@@ -264,7 +284,20 @@ func onMessageEdit(s *discordgo.Session, m *discordgo.MessageUpdate) {
 		return
 	}
 
-	fmt.Printf("[メッセージ編集] %s が変更: %s\n", m.Author.Username, m.Content)
+	guild, _ := s.Guild(m.GuildID)
+	guildName := "DM"
+	if guild != nil {
+		guildName = guild.Name
+	}
+	channel, _ := s.Channel(m.ChannelID)
+	channelName := "unknown"
+	if channel != nil {
+		channelName = channel.Name
+	}
+
+	ctx := Ctx().Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).
+		User(m.Author.Username, m.Author.ID).Message(m.Message.ID)
+	Log(SystemMessage, LevelInfo, ctx, "Edit: %s", strings.ReplaceAll(m.Content, "\n", "\\n"))
 
 	saveMessage(s, m.GuildID, m.ChannelID, MessageOperationEdit, m.Message)
 }
@@ -272,7 +305,19 @@ func onMessageEdit(s *discordgo.Session, m *discordgo.MessageUpdate) {
 // ==================== メッセージ削除 ====================
 
 func onMessageDelete(s *discordgo.Session, m *discordgo.MessageDelete) {
-	fmt.Printf("[メッセージ削除] ID: %s がチャンネル(ID: %s)から削除されました\n", m.ID, m.ChannelID)
+	guild, _ := s.Guild(m.GuildID)
+	guildName := "DM"
+	if guild != nil {
+		guildName = guild.Name
+	}
+	channel, _ := s.Channel(m.ChannelID)
+	channelName := "unknown"
+	if channel != nil {
+		channelName = channel.Name
+	}
+
+	ctx := Ctx().Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).Message(m.Message.ID)
+	Log(SystemMessage, LevelInfo, ctx, "Delete")
 
 	msg := Message{
 		Operation: MessageOperationDelete,
@@ -282,7 +327,7 @@ func onMessageDelete(s *discordgo.Session, m *discordgo.MessageDelete) {
 	}
 	dir := channelMessagesDir(m.GuildID, m.ChannelID)
 	if err := appendMessageLog(dir, msg); err != nil {
-		log.Printf("警告: 削除メッセージのログ保存に失敗しました: %v", err)
+		Log(SystemMessage, LevelWarn, ctx, "削除メッセージのログ保存に失敗しました: %v", err)
 	}
 }
 
@@ -298,6 +343,8 @@ func onUserUpdate(s *discordgo.Session, u *discordgo.UserUpdate) {
 }
 
 func saveUserData(author *discordgo.User) {
+	uctx := Ctx().User(author.Username, author.ID)
+
 	current := User{
 		ID:            author.ID,
 		Username:      author.Username,
@@ -309,18 +356,18 @@ func saveUserData(author *discordgo.User) {
 
 	changed, err := appendHistoryIfChanged(userDir(author.ID), current)
 	if err != nil {
-		log.Printf("警告: ユーザー(%s)の設定保存に失敗しました: %v", author.ID, err)
+		Log(SystemUser, LevelError, uctx, "設定保存に失敗しました: %v", err)
 	} else if changed {
-		fmt.Printf("[ユーザー設定更新] %s の設定を保存しました\n", author.ID)
+		Log(SystemUser, LevelInfo, uctx, "設定を保存しました")
 	}
 
 	if author.Avatar != "" {
 		avatarURL := discordgo.EndpointUserAvatar(author.ID, author.Avatar)
 		iconChanged, err := saveIconIfChanged(userIconsDir(author.ID), author.Avatar, avatarURL)
 		if err != nil {
-			log.Printf("警告: ユーザー(%s)のアイコン保存に失敗しました: %v", author.ID, err)
+			Log(SystemUser, LevelError, uctx, "アイコン保存に失敗しました: %v", err)
 		} else if iconChanged {
-			fmt.Printf("[ユーザーアイコン更新] %s のアイコンを保存しました\n", author.ID)
+			Log(SystemUser, LevelInfo, uctx, "アイコンを保存しました")
 		}
 	}
 }
@@ -340,7 +387,7 @@ func saveGuildData(s *discordgo.Session, guildID string) {
 	if err != nil || guild == nil {
 		guild, err = s.Guild(guildID)
 		if err != nil {
-			log.Printf("警告: ギルド(%s)の取得に失敗しました: %v", guildID, err)
+			Log(SystemGuild, LevelWarn, Ctx().Guild("", guildID), "取得に失敗しました: %v", err)
 			return
 		}
 	}
@@ -348,6 +395,8 @@ func saveGuildData(s *discordgo.Session, guildID string) {
 }
 
 func saveGuildDataFromGuild(guild *discordgo.Guild) {
+	gctx := Ctx().Guild(guild.Name, guild.ID)
+
 	current := Guild{
 		ID:              guild.ID,
 		Name:            guild.Name,
@@ -360,32 +409,32 @@ func saveGuildDataFromGuild(guild *discordgo.Guild) {
 
 	changed, err := appendHistoryIfChanged(guildDir(guild.ID), current)
 	if err != nil {
-		log.Printf("警告: ギルド(%s)の設定保存に失敗しました: %v", guild.ID, err)
+		Log(SystemGuild, LevelWarn, gctx, "設定保存に失敗しました: %v", err)
 	} else if changed {
-		fmt.Printf("[ギルド設定更新] %s の設定を保存しました\n", guild.ID)
+		Log(SystemGuild, LevelInfo, gctx, "設定を保存しました")
 	}
 
 	if guild.Icon != "" {
 		iconURL := discordgo.EndpointGuildIcon(guild.ID, guild.Icon)
 		iconChanged, err := saveIconIfChanged(guildIconsDir(guild.ID), guild.Icon, iconURL)
 		if err != nil {
-			log.Printf("警告: ギルド(%s)のアイコン保存に失敗しました: %v", guild.ID, err)
+			Log(SystemGuild, LevelWarn, gctx, "アイコン保存に失敗しました: %v", err)
 		} else if iconChanged {
-			fmt.Printf("[ギルドアイコン更新] %s のアイコンを保存しました\n", guild.ID)
+			Log(SystemGuild, LevelInfo, gctx, "アイコンを保存しました")
 		}
 	}
 
-	// カスタム絵文字の差分チェック(新規追加分のみ保存)
-	saveGuildEmojis(guild.ID, guild.Emojis)
+	saveGuildEmojis(guild.ID, guild.Name, guild.Emojis)
 }
 
-func saveGuildEmojis(guildID string, emojis []*discordgo.Emoji) {
+func saveGuildEmojis(guildID, guildName string, emojis []*discordgo.Emoji) {
 	dir := guildEmojisDir(guildID)
 	for _, e := range emojis {
 		if e.ID == "" {
 			continue
 		}
-		// 既に同一IDの絵文字ファイルが存在するかチェック
+		ectx := Ctx().Guild(guildName, guildID).Emoji(e.Name, e.ID)
+
 		matches, _ := filepath.Glob(filepath.Join(dir, "*__"+e.Name+".png"))
 		matchesAnimated, _ := filepath.Glob(filepath.Join(dir, "*__"+e.Name+".gif"))
 		if len(matches) > 0 || len(matchesAnimated) > 0 {
@@ -400,15 +449,15 @@ func saveGuildEmojis(guildID string, emojis []*discordgo.Emoji) {
 			url = discordgo.EndpointEmojiAnimated(e.ID)
 		}
 		if err := ensureDir(dir); err != nil {
-			log.Printf("警告: 絵文字ディレクトリ作成に失敗しました: %v", err)
+			Log(SystemEmoji, LevelWarn, ectx, "絵文字ディレクトリ作成に失敗しました: %v", err)
 			continue
 		}
 		filename := timestampName() + "__" + e.Name + ext
 		if err := downloadFile(url, filepath.Join(dir, filename)); err != nil {
-			log.Printf("警告: 絵文字(%s)のダウンロードに失敗しました: %v", e.Name, err)
+			Log(SystemEmoji, LevelWarn, ectx, "ダウンロードに失敗しました: %v", err)
 			continue
 		}
-		fmt.Printf("[絵文字追加] %s を保存しました\n", e.Name)
+		Log(SystemEmoji, LevelInfo, ectx, "絵文字を保存しました")
 	}
 }
 
@@ -430,7 +479,7 @@ func saveChannelData(s *discordgo.Session, guildID, channelID string) {
 	if err != nil || channel == nil {
 		channel, err = s.Channel(channelID)
 		if err != nil {
-			log.Printf("警告: チャンネル(%s)の取得に失敗しました: %v", channelID, err)
+			Log(SystemChannel, LevelWarn, Ctx().Guild("", guildID).Channel("", channelID), "取得に失敗しました: %v", err)
 			return
 		}
 	}
@@ -438,6 +487,8 @@ func saveChannelData(s *discordgo.Session, guildID, channelID string) {
 }
 
 func saveChannelDataFromChannel(guildID string, channel *discordgo.Channel) {
+	cctx := Ctx().Guild("", guildID).Channel(channel.Name, channel.ID)
+
 	current := Channel{
 		ID:       channel.ID,
 		Name:     channel.Name,
@@ -447,9 +498,9 @@ func saveChannelDataFromChannel(guildID string, channel *discordgo.Channel) {
 
 	changed, err := appendHistoryIfChanged(channelDir(guildID, channel.ID), current)
 	if err != nil {
-		log.Printf("警告: チャンネル(%s)の設定保存に失敗しました: %v", channel.ID, err)
+		Log(SystemChannel, LevelWarn, cctx, "設定保存に失敗しました: %v", err)
 	} else if changed {
-		fmt.Printf("[チャンネル設定更新] %s の設定を保存しました\n", channel.ID)
+		Log(SystemChannel, LevelInfo, cctx, "設定を保存しました")
 	}
 }
 
@@ -462,6 +513,8 @@ func onGuildMemberAdd(s *discordgo.Session, m *discordgo.GuildMemberAdd) {
 	}
 	saveUserData(m.User)
 
+	ctx := Ctx().Guild("", m.GuildID).User(m.User.Username, m.User.ID)
+
 	entry := Member{
 		Operation: MemberJoin,
 		UserID:    m.User.ID,
@@ -470,10 +523,10 @@ func onGuildMemberAdd(s *discordgo.Session, m *discordgo.GuildMemberAdd) {
 		JoinedAt:  m.JoinedAt,
 	}
 	if err := appendMemberLog(m.GuildID, entry); err != nil {
-		log.Printf("警告: メンバー参加(%s)のログ保存に失敗しました: %v", m.User.ID, err)
+		Log(SystemUser, LevelWarn, ctx, "参加ログの保存に失敗しました: %v", err)
 		return
 	}
-	fmt.Printf("[メンバー参加] %s がサーバー(%s)に参加しました\n", m.User.ID, m.GuildID)
+	Log(SystemUser, LevelInfo, ctx, "サーバーに参加しました")
 }
 
 // onGuildMemberRemove はメンバーの離脱(またはキック/BAN)を検出した時点でLeaveとして記録する。
@@ -481,6 +534,8 @@ func onGuildMemberRemove(s *discordgo.Session, m *discordgo.GuildMemberRemove) {
 	if m.User == nil {
 		return
 	}
+
+	ctx := Ctx().Guild("", m.GuildID).User(m.User.Username, m.User.ID)
 
 	entry := Member{
 		Operation: MemberLeave,
@@ -491,10 +546,10 @@ func onGuildMemberRemove(s *discordgo.Session, m *discordgo.GuildMemberRemove) {
 		entry.Roles = m.Roles
 	}
 	if err := appendMemberLog(m.GuildID, entry); err != nil {
-		log.Printf("警告: メンバー離脱(%s)のログ保存に失敗しました: %v", m.User.ID, err)
+		Log(SystemUser, LevelWarn, ctx, "離脱ログの保存に失敗しました: %v", err)
 		return
 	}
-	fmt.Printf("[メンバー離脱] %s がサーバー(%s)から離脱しました\n", m.User.ID, m.GuildID)
+	Log(SystemUser, LevelInfo, ctx, "サーバーから離脱しました")
 }
 
 // onGuildMemberUpdate はニックネーム・ロールなどの変更をメッセージ投稿を伴わずに捕捉する。
@@ -507,6 +562,8 @@ func onGuildMemberUpdate(s *discordgo.Session, m *discordgo.GuildMemberUpdate) {
 }
 
 func saveMemberData(guildID, userID string, member *discordgo.Member) {
+	ctx := Ctx().Guild("", guildID).User("", userID)
+
 	current := Member{
 		Operation: MemberUpdate,
 		UserID:    userID,
@@ -533,10 +590,10 @@ func saveMemberData(guildID, userID string, member *discordgo.Member) {
 	}
 
 	if err := appendMemberLog(guildID, current); err != nil {
-		log.Printf("警告: メンバー(%s)のログ保存に失敗しました: %v", userID, err)
+		Log(SystemUser, LevelWarn, ctx, "ログ保存に失敗しました: %v", err)
 		return
 	}
-	fmt.Printf("[メンバー更新] %s の情報を記録しました (%s)\n", userID, current.Operation)
+	Log(SystemUser, LevelInfo, ctx, "情報を記録しました (%s)", current.Operation)
 }
 
 // memberChanged は当日以前の全メンバーログを走査し、対象ユーザーの最新レコード(Leave以降は無視)と
