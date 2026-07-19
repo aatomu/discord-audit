@@ -66,9 +66,9 @@ type Channel struct {
 type MessageOperation string
 
 const (
-	MessageOperationCreate = "Create"
-	MessageOperationEdit   = "Edit"
-	MessageOperationDelete = "Delete"
+	MessageOperationCreate MessageOperation = "Create"
+	MessageOperationEdit   MessageOperation = "Edit"
+	MessageOperationDelete MessageOperation = "Delete"
 )
 
 type Attachment struct {
