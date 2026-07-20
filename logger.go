@@ -36,6 +36,13 @@ func Ctx() *LogCtx {
 	return &LogCtx{}
 }
 
+// Bot はマルチトークン運用時に、どのBot(label: "bot1","bot2",...)が処理したイベントかを
+// ログ先頭に付与するために使う。呼ぶ場合はチェーンの先頭で呼び出すこと(例: Ctx().Bot("bot1").Guild(...))。
+func (c *LogCtx) Bot(label string) *LogCtx {
+	c.parts = append(c.parts, fmt.Sprintf("bot:%s", label))
+	return c
+}
+
 func (c *LogCtx) Guild(name, id string) *LogCtx {
 	c.parts = append(c.parts, fmt.Sprintf("guild:%s(%s)", name, id))
 	return c
@@ -69,10 +76,9 @@ func (c *LogCtx) String() string {
 // ctx が nil、または空の場合は ctx 部分を省略する。
 func Log(s LogSystem, l LogLevel, ctx *LogCtx, format string, arg ...any) {
 	msg := fmt.Sprintf(format, arg...)
-	ts := nowUTC().Format("2006-01-02 15:04:05")
 	if ctx != nil && len(ctx.parts) > 0 {
-		log.Printf("%s [%s/%s]: %s: %s", ts, s, l, ctx.String(), msg)
+		log.Printf("[%s/%s]: %s: %s", s, l, ctx.String(), msg)
 	} else {
-		log.Printf("%s [%s/%s]: %s", ts, s, l, msg)
+		log.Printf("[%s/%s]: %s", s, l, msg)
 	}
 }
