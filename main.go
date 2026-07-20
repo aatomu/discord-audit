@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,14 +19,94 @@ func nowUTC() time.Time {
 	return time.Now().UTC()
 }
 
-// preloadLimiter はプリロード実行時に使う共通レートリミッター。
-// Discordのグローバル制限(約50 req/秒)の半分以下、20 req/秒に制限する。
-var preloadLimiter = newRateLimiter(20)
-
 func init() {
 	os.MkdirAll("./user", 0750)
 	os.MkdirAll("./guilds", 0750)
 }
+
+// ==================== 複数Bot(マルチトークン)対応 ====================
+//
+// DISCORD_TOKEN は "token1,token2,token3" のようにカンマ区切りで複数指定できる。
+// Botごとに閲覧できるチャンネルが異なる(権限の違いで見えるBot/見えないBotがある)ため、
+// 「ギルド単位でどれか1つのBotに専任させる」方式は取りこぼしの原因になる。
+// そのため各Botは自分が見えている範囲を独立に処理しつつ、同一イベントを複数のBotが
+// 重複して受信した場合にのみ、短期間(dedupTTL)のイベントキャッシュで二重記録を防ぐ。
+// (= キャッシュに無ければ処理する、あればスキップする 方式)
+
+type botSession struct {
+	session *discordgo.Session
+	label   string       // ログ表示用の識別子("bot1(1234567890)"のような形式)
+	limiter *rateLimiter // トークンごとに独立したプリロード用レートリミッター
+}
+
+var (
+	sessionLabelMu sync.RWMutex
+	sessionLabel   = map[*discordgo.Session]string{} // *discordgo.Session -> label
+)
+
+func labelOf(s *discordgo.Session) string {
+	sessionLabelMu.RLock()
+	defer sessionLabelMu.RUnlock()
+	if l, ok := sessionLabel[s]; ok {
+		return l
+	}
+	return "unknown"
+}
+
+// parseTokens は DISCORD_TOKEN の値を ',' で分割し、前後の空白除去・重複除去を行う。
+func parseTokens(raw string) []string {
+	seen := map[string]bool{}
+	var tokens []string
+	for _, t := range strings.Split(raw, ",") {
+		t = strings.TrimSpace(t)
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		tokens = append(tokens, t)
+	}
+	return tokens
+}
+
+// ==================== イベント重複排除キャッシュ ====================
+//
+// 複数Botが同じギルド/チャンネルを見えている場合、同一イベントが複数Botから
+// ほぼ同時に届くことがある。キー(イベントの種類+対象ID、必要に応じて内容のハッシュ)を
+// dedupTTLの間だけ記憶しておき、既に見たキーであれば処理をスキップする。
+
+const dedupTTL = 60 * time.Second
+
+type dedupCache struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+func newDedupCache() *dedupCache {
+	return &dedupCache{seen: map[string]time.Time{}}
+}
+
+// shouldProcess はkeyがttl以内に処理済みでなければtrueを返し、処理済みとして記録する。
+// 既にttl以内に処理済みであればfalseを返す(呼び出し側はスキップする)。
+func (d *dedupCache) shouldProcess(key string, ttl time.Duration) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	if t, ok := d.seen[key]; ok && now.Sub(t) < ttl {
+		return false
+	}
+	d.seen[key] = now
+	if len(d.seen) > 5000 {
+		cutoff := now.Add(-ttl)
+		for k, v := range d.seen {
+			if v.Before(cutoff) {
+				delete(d.seen, k)
+			}
+		}
+	}
+	return true
+}
+
+var eventDedup = newDedupCache()
 
 func main() {
 	preloadFlag := flag.String("preload", "", "yyyymmdd 形式の日付。指定するとその日まで遡って全ギルド・メンバー・メッセージ履歴を取得します")
@@ -40,52 +121,80 @@ func main() {
 		preloadUntil = &t
 	}
 
-	token := os.Getenv("DISCORD_TOKEN")
-	if token == "" {
+	rawTokens := os.Getenv("DISCORD_TOKEN")
+	if rawTokens == "" {
 		log.Fatal("環境変数 DISCORD_TOKEN が設定されていません")
 	}
-
-	dg, err := discordgo.New("Bot " + token)
-	if err != nil {
-		log.Fatalf("Discordセッションの作成に失敗しました: %v", err)
+	tokens := parseTokens(rawTokens)
+	if len(tokens) == 0 {
+		log.Fatal("環境変数 DISCORD_TOKEN に有効なトークンがありません")
 	}
 
-	dg.Identify.Intents =
-		discordgo.IntentsGuilds |
-			discordgo.IntentsGuildMessages |
-			discordgo.IntentsDirectMessages |
-			discordgo.IntentMessageContent |
-			discordgo.IntentsGuildEmojis
+	var sessions []*botSession
+	for i, token := range tokens {
+		label := fmt.Sprintf("bot%d(-)", i+1)
 
-	dg.AddHandler(onMessageCreate)
-	dg.AddHandler(onMessageEdit)
-	dg.AddHandler(onMessageDelete)
-	dg.AddHandler(onGuildMemberAdd)
-	dg.AddHandler(onGuildMemberRemove)
-	dg.AddHandler(onGuildMemberUpdate)
-	dg.AddHandler(onChannelUpdate)
-	dg.AddHandler(onGuildUpdate)
-	dg.AddHandler(onUserUpdate)
+		dg, err := discordgo.New("Bot " + token)
+		if err != nil {
+			log.Fatalf("[%s] Discordセッションの作成に失敗しました: %v", label, err)
+		}
 
-	if preloadUntil != nil {
+		dg.Identify.Intents =
+			discordgo.IntentsGuilds |
+				discordgo.IntentsGuildMessages |
+				discordgo.IntentsDirectMessages |
+				discordgo.IntentMessageContent |
+				discordgo.IntentsGuildEmojis
+
+		sessionLabelMu.Lock()
+		sessionLabel[dg] = label
+		sessionLabelMu.Unlock()
+
+		dg.AddHandler(onMessageCreate)
+		dg.AddHandler(onMessageEdit)
+		dg.AddHandler(onMessageDelete)
+		dg.AddHandler(onGuildMemberAdd)
+		dg.AddHandler(onGuildMemberRemove)
+		dg.AddHandler(onGuildMemberUpdate)
+		dg.AddHandler(onChannelUpdate)
+		dg.AddHandler(onGuildUpdate)
+		dg.AddHandler(onUserUpdate)
+
+		bs := &botSession{session: dg, label: label, limiter: newRateLimiter(20)}
+		sessions = append(sessions, bs)
+
 		// Readyイベント受信後(ギルド一覧がStateに載った後)にプリロードを1度だけ実行する。
 		var once bool
 		dg.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
-			if once {
-				return
+			bs.label = fmt.Sprintf("%s(%s)", r.User.Username, r.User.ID)
+			sessionLabelMu.Lock()
+			sessionLabel[dg] = bs.label
+			sessionLabelMu.Unlock()
+
+			Log(SystemUser, LevelInfo, Ctx().Bot(bs.label), "bot has on Ready.")
+
+			if preloadUntil != nil {
+				if once {
+					return
+				}
+				once = true
+				go runPreload(bs, *preloadUntil)
 			}
-			once = true
-			go runPreload(s, *preloadUntil)
 		})
 	}
 
-	err = dg.Open()
-	if err != nil {
-		log.Fatalf("Discordへの接続に失敗しました: %v", err)
+	for _, bs := range sessions {
+		if err := bs.session.Open(); err != nil {
+			log.Fatalf("[%s] Discordへの接続に失敗しました: %v", bs.label, err)
+		}
 	}
-	defer dg.Close()
+	defer func() {
+		for _, bs := range sessions {
+			bs.session.Close()
+		}
+	}()
 
-	log.Println("Botが起動しました。Ctrl+C で終了します。")
+	log.Printf("Botの起動を呼び出ししました(%d個のToken)。Ctrl+C で終了します。", len(sessions))
 
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
@@ -98,17 +207,20 @@ func main() {
 // 全ギルドの設定・メンバー一覧・全チャンネルのメッセージ履歴を取得して保存する。
 // Discordのレート制限(概ね50 req/秒)の半分以下(20 req/秒)で処理する。
 
-func runPreload(s *discordgo.Session, until time.Time) {
-	Log(SystemPreload, LevelInfo, nil, "%s まで遡ってデータを取得します", until.Format("2006-01-02"))
+func runPreload(bs *botSession, until time.Time) {
+	s := bs.session
+	gctxAll := Ctx().Bot(bs.label)
+	Log(SystemPreload, LevelInfo, gctxAll, "%s まで遡ってデータを取得します", until.Format("2006-01-02"))
 
 	guilds := s.State.Guilds
 	targetGuilds := len(guilds)
 	for i, g := range guilds {
 		guildNo := i + 1
-		gctx := Ctx().Guild(g.Name, g.ID)
+		gctx := Ctx().Bot(bs.label).Guild(g.Name, g.ID)
+
 		Log(SystemPreload, LevelInfo, gctx, "No.%d/%d 処理を開始します", guildNo, targetGuilds)
 
-		preloadLimiter.wait()
+		bs.limiter.wait()
 		full, err := s.Guild(g.ID)
 		if err != nil {
 			Log(SystemPreload, LevelWarn, gctx, "No.%d ギルドの取得に失敗しました: %v", guildNo, err)
@@ -116,22 +228,23 @@ func runPreload(s *discordgo.Session, until time.Time) {
 		}
 
 		saveGuildDataFromGuild(full)
-		preloadMembers(s, guildNo, full.Name, full.ID)
-		preloadChannels(s, guildNo, full.Name, full.ID, until)
+		preloadMembers(bs, guildNo, full.Name, full.ID)
+		preloadChannels(bs, guildNo, full.Name, full.ID, until)
 
 		Log(SystemPreload, LevelInfo, gctx, "No.%d 処理が完了しました", guildNo)
 	}
 
-	Log(SystemPreload, LevelInfo, nil, "すべてのギルドの処理が完了しました")
+	Log(SystemPreload, LevelInfo, gctxAll, "すべてのギルドの処理が完了しました")
 }
 
 // preloadMembers はギルドの全メンバーをページングで取得し、Previous操作として記録する。
-func preloadMembers(s *discordgo.Session, guildNo int, guildName, guildID string) {
-	gctx := Ctx().Guild(guildName, guildID)
+func preloadMembers(bs *botSession, guildNo int, guildName, guildID string) {
+	s := bs.session
+	gctx := Ctx().Bot(bs.label).Guild(guildName, guildID)
 	after := ""
 	total := 0
 	for {
-		preloadLimiter.wait()
+		bs.limiter.wait()
 		members, err := s.GuildMembers(guildID, after, 1000)
 		if err != nil {
 			Log(SystemPreload, LevelWarn, gctx, "No.%d メンバーの取得に失敗しました: %v", guildNo, err)
@@ -145,6 +258,10 @@ func preloadMembers(s *discordgo.Session, guildNo int, guildName, guildID string
 				continue
 			}
 			saveUserData(m.User)
+			key := fmt.Sprintf("member:previous:%s:%s", guildID, m.User.ID)
+			if !eventDedup.shouldProcess(key, dedupTTL) {
+				continue
+			}
 			entry := Member{
 				Operation:                  MemberPrevious,
 				UserID:                     m.User.ID,
@@ -154,7 +271,7 @@ func preloadMembers(s *discordgo.Session, guildNo int, guildName, guildID string
 				CommunicationDisabledUntil: m.CommunicationDisabledUntil,
 			}
 			if err := appendMemberLog(guildID, entry); err != nil {
-				Log(SystemPreload, LevelWarn, Ctx().Guild(guildName, guildID).User(m.User.Username, m.User.ID),
+				Log(SystemPreload, LevelWarn, Ctx().Bot(bs.label).Guild(guildName, guildID).User(m.User.Username, m.User.ID),
 					"No.%d メンバーの保存に失敗しました: %v", guildNo, err)
 			}
 			total++
@@ -169,9 +286,10 @@ func preloadMembers(s *discordgo.Session, guildNo int, guildName, guildID string
 
 // preloadChannels はギルド内の全テキストチャンネル(スレッド含む)を取得し、
 // 設定を保存した上でメッセージ履歴のプリロードを行う。
-func preloadChannels(s *discordgo.Session, guildNo int, guildName, guildID string, until time.Time) {
-	gctx := Ctx().Guild(guildName, guildID)
-	preloadLimiter.wait()
+func preloadChannels(bs *botSession, guildNo int, guildName, guildID string, until time.Time) {
+	s := bs.session
+	gctx := Ctx().Bot(bs.label).Guild(guildName, guildID)
+	bs.limiter.wait()
 	channels, err := s.GuildChannels(guildID)
 	if err != nil {
 		Log(SystemPreload, LevelWarn, gctx, "No.%d チャンネルの取得に失敗しました: %v", guildNo, err)
@@ -182,7 +300,7 @@ func preloadChannels(s *discordgo.Session, guildNo int, guildName, guildID strin
 			continue
 		}
 		saveChannelDataFromChannel(guildID, c)
-		preloadMessages(s, guildNo, guildName, guildID, c.Name, c.ID, until)
+		preloadMessages(bs, guildNo, guildName, guildID, c.Name, c.ID, until)
 	}
 }
 
@@ -201,12 +319,13 @@ func isTextLikeChannel(c *discordgo.Channel) bool {
 
 // preloadMessages は指定チャンネルのメッセージを新しい方から100件ずつ遡って取得し、
 // until より古いメッセージに到達するまで保存を続ける。
-func preloadMessages(s *discordgo.Session, guildNo int, guildName, guildID, channelName, channelID string, until time.Time) {
-	cctx := Ctx().Guild(guildName, guildID).Channel(channelName, channelID)
+func preloadMessages(bs *botSession, guildNo int, guildName, guildID, channelName, channelID string, until time.Time) {
+	s := bs.session
+	cctx := Ctx().Bot(bs.label).Guild(guildName, guildID).Channel(channelName, channelID)
 	beforeID := ""
 	total := 0
 	for {
-		preloadLimiter.wait()
+		bs.limiter.wait()
 		msgs, err := s.ChannelMessages(channelID, 100, beforeID, "", "")
 		if err != nil {
 			Log(SystemPreload, LevelWarn, cctx, "No.%d メッセージ取得に失敗しました: %v", guildNo, err)
@@ -254,7 +373,7 @@ func onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		channelName = channel.Name
 	}
 
-	ctx := Ctx().Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).
+	ctx := Ctx().Bot(labelOf(s)).Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).
 		User(m.Author.Username, m.Author.ID).Message(m.Message.ID)
 	Log(SystemMessage, LevelInfo, ctx, "Create: %s", strings.ReplaceAll(m.Content, "\n", "\\n"))
 
@@ -296,7 +415,7 @@ func onMessageEdit(s *discordgo.Session, m *discordgo.MessageUpdate) {
 		channelName = channel.Name
 	}
 
-	ctx := Ctx().Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).
+	ctx := Ctx().Bot(labelOf(s)).Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).
 		User(m.Author.Username, m.Author.ID).Message(m.Message.ID)
 	Log(SystemMessage, LevelInfo, ctx, "Edit: %s", strings.ReplaceAll(m.Content, "\n", "\\n"))
 
@@ -317,7 +436,13 @@ func onMessageDelete(s *discordgo.Session, m *discordgo.MessageDelete) {
 		channelName = channel.Name
 	}
 
-	ctx := Ctx().Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).Message(m.Message.ID)
+	// 複数Botが同じチャンネルを閲覧できる場合の重複記録を防ぐ。
+	key := fmt.Sprintf("message:%s:%s", MessageOperationDelete, m.ID)
+	if !eventDedup.shouldProcess(key, dedupTTL) {
+		return
+	}
+
+	ctx := Ctx().Bot(labelOf(s)).Guild(guildName, m.GuildID).Channel(channelName, m.ChannelID).Message(m.Message.ID)
 	Log(SystemMessage, LevelInfo, ctx, "Delete")
 
 	msg := Message{
@@ -441,6 +566,10 @@ func saveGuildEmojis(guildID, guildName string, emojis []*discordgo.Emoji) {
 		if len(matches) > 0 || len(matchesAnimated) > 0 {
 			continue
 		}
+		// 複数Botが同じ絵文字追加をほぼ同時に検出した場合の重複ダウンロードを防ぐ。
+		if !eventDedup.shouldProcess(fmt.Sprintf("emoji:%s:%s", guildID, e.ID), dedupTTL) {
+			continue
+		}
 		ext := ".png"
 		if e.Animated {
 			ext = ".gif"
@@ -514,7 +643,12 @@ func onGuildMemberAdd(s *discordgo.Session, m *discordgo.GuildMemberAdd) {
 	}
 	saveUserData(m.User)
 
-	ctx := Ctx().Guild("", m.GuildID).User(m.User.Username, m.User.ID)
+	// メンバー参加はギルド全体のイベントのため、同じギルドにいる複数Botが重複して受信し得る。
+	if !eventDedup.shouldProcess(fmt.Sprintf("member:add:%s:%s", m.GuildID, m.User.ID), dedupTTL) {
+		return
+	}
+
+	ctx := Ctx().Bot(labelOf(s)).Guild("", m.GuildID).User(m.User.Username, m.User.ID)
 
 	entry := Member{
 		Operation: MemberJoin,
@@ -535,8 +669,11 @@ func onGuildMemberRemove(s *discordgo.Session, m *discordgo.GuildMemberRemove) {
 	if m.User == nil {
 		return
 	}
+	if !eventDedup.shouldProcess(fmt.Sprintf("member:remove:%s:%s", m.GuildID, m.User.ID), dedupTTL) {
+		return
+	}
 
-	ctx := Ctx().Guild("", m.GuildID).User(m.User.Username, m.User.ID)
+	ctx := Ctx().Bot(labelOf(s)).Guild("", m.GuildID).User(m.User.Username, m.User.ID)
 
 	entry := Member{
 		Operation: MemberLeave,
@@ -576,6 +713,14 @@ func saveMemberData(guildID, userID string, member *discordgo.Member) {
 	}
 	if member.CommunicationDisabledUntil != nil {
 		current.CommunicationDisabledUntil = member.CommunicationDisabledUntil
+	}
+
+	// 複数Botが同じメンバー変更をほぼ同時に検出した場合の重複記録を防ぐ。
+	// (新しい状態の内容そのものをキーに含めることで、内容が異なる正当な連続更新は
+	// 別イベントとして扱われる)
+	dedupKey := fmt.Sprintf("member:update:%s:%s:%s:%s", guildID, userID, current.Nickname, strings.Join(current.Roles, ","))
+	if !eventDedup.shouldProcess(dedupKey, dedupTTL) {
+		return
 	}
 
 	// 直近保存したメンバー情報(operationは無視して比較)と差分があれば記録する
@@ -664,6 +809,13 @@ func stringSlicesEqual(a, b []string) bool {
 
 func saveMessage(s *discordgo.Session, guildID, channelID string, op MessageOperation, dm *discordgo.Message) {
 	if dm == nil {
+		return
+	}
+
+	// 複数Botが同じチャンネルを閲覧できる場合、同一メッセージのイベントが重複して
+	// 届くことがあるため、(操作種別+メッセージID)単位で短期間だけ重複排除する。
+	key := fmt.Sprintf("message:%s:%s", op, dm.ID)
+	if !eventDedup.shouldProcess(key, dedupTTL) {
 		return
 	}
 

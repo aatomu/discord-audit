@@ -169,6 +169,11 @@ func saveIconIfChanged(dir string, hash string, downloadURL string) (bool, error
 	if hash == "" {
 		return false, nil
 	}
+	// 複数Botが同一の設定変更(アイコン変更)をほぼ同時に検出した場合の重複ダウンロードを防ぐ。
+	key := fmt.Sprintf("icon:%s:%s", dir, hash)
+	if !eventDedup.shouldProcess(key, dedupTTL) {
+		return false, nil
+	}
 	lastHashPath := filepath.Join(dir, ".last_hash")
 	lastHash, _ := os.ReadFile(lastHashPath)
 	if string(lastHash) == hash {
