@@ -136,7 +136,8 @@ func main() {
 
 		dg, err := discordgo.New("Bot " + token)
 		if err != nil {
-			log.Fatalf("[%s] Discordセッションの作成に失敗しました: %v", label, err)
+			log.Printf("[%s] Discordセッションの作成に失敗しました: %v\n", label, err)
+			continue
 		}
 
 		dg.Identify.Intents =
@@ -185,7 +186,7 @@ func main() {
 
 	for _, bs := range sessions {
 		if err := bs.session.Open(); err != nil {
-			log.Fatalf("[%s] Discordへの接続に失敗しました: %v", bs.label, err)
+			log.Printf("[%s] Discordへの接続に失敗しました: %v\n", bs.label, err)
 		}
 	}
 	defer func() {
