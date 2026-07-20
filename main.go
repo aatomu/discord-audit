@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -667,9 +668,16 @@ func saveMessage(s *discordgo.Session, guildID, channelID string, op MessageOper
 	}
 
 	attachmentsDir := channelAttachmentsDir(guildID, channelID)
+	// 添付ファイルのファイル名プレフィックスは、ダウンロードした時刻ではなく
+	// メッセージの作成日時(dm.Timestamp)を使う。これにより --preload 時も
+	// 取得日ではなく本来の投稿日時を反映したファイル名になる。
+	attachmentPrefix := timestampName()
+	if !dm.Timestamp.IsZero() {
+		attachmentPrefix = dm.Timestamp.UTC().Format("20060102_150405")
+	}
 	var savedAttachments []Attachment
-	for _, a := range dm.Attachments {
-		localName := timestampName() + "__" + a.Filename
+	for i, a := range dm.Attachments {
+		localName := fmt.Sprintf("%s_%02d__%s", attachmentPrefix, i+1, a.Filename)
 		localPath := filepath.Join(attachmentsDir, localName)
 		if err := ensureDir(attachmentsDir); err != nil {
 			log.Printf("警告: 添付ファイルディレクトリ作成に失敗しました: %v", err)
