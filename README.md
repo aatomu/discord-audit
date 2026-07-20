@@ -1,8 +1,22 @@
 # discord-audit
-
 discord bot の取得できる各種情報を記録する。
 
-ファイル構造:
+## 環境
+`go version go1.26.4 linux/amd64`
+
+## 実行
+```bash
+# Set environment your bot tokens
+export DISCORD_TOKEN="<your_bot_token>"
+# Run for audit discord bot
+go run .
+```
+
+## Botの推奨権限
+- Channel View
+- Message Read History
+
+## 保存されるファイル構造
 |`filename`|Description|
 |:-|:-|
 |./user/| すべてのユーザーについて保存されているフォルダー|
