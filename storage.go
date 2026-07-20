@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 )
@@ -220,12 +221,18 @@ func (r *rateLimiter) wait() {
 
 // ---------- メッセージ日次ログの追記 ----------
 
-// appendMessageLog は指定日の messages/yyyymmdd.json (JSON配列) に msg を追記する。
+// appendMessageLog は messages/yyyymmdd.json (JSON配列) に msg を追記する。
+// ファイル名の日付は処理時点の日付ではなく、msg.Timestamp(メッセージの作成日時)を基準にする。
+// これにより --preload で過去メッセージを取得した場合も、取得日ではなく本来の投稿日のファイルに保存される。
 func appendMessageLog(dir string, msg Message) error {
 	if err := ensureDir(dir); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, dateName()+".json")
+	name := dateName()
+	if !msg.Timestamp.IsZero() {
+		name = msg.Timestamp.UTC().Format("20060102")
+	}
+	path := filepath.Join(dir, name+".json")
 
 	var msgs []Message
 	if data, err := os.ReadFile(path); err == nil {
@@ -238,6 +245,13 @@ func appendMessageLog(dir string, msg Message) error {
 	}
 
 	msgs = append(msgs, msg)
+
+	// 常に作成日時(Timestamp)の昇順(古い順が先頭、新しい順が末尾)になるよう並べ替える。
+	// 通常のイベント受信時は既に昇順で追記されるが、--preload 時は新しいメッセージから
+	// 遡って取得するため、ソートしないと逆順になってしまう。
+	sort.SliceStable(msgs, func(i, j int) bool {
+		return msgs[i].Timestamp.Before(msgs[j].Timestamp)
+	})
 
 	b, err := json.MarshalIndent(msgs, "", "  ")
 	if err != nil {
