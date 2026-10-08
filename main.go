@@ -187,6 +187,7 @@ func main() {
 	for _, bs := range sessions {
 		if err := bs.session.Open(); err != nil {
 			log.Printf("[%s] Discordへの接続に失敗しました: %v\n", bs.label, err)
+			bs.session.Close()
 		}
 	}
 	defer func() {
